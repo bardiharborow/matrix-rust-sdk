@@ -1160,6 +1160,13 @@ impl MatrixMockServer {
         self.mock_endpoint(mock, RoomSummaryEndpoint)
     }
 
+    /// Creates a prebuilt mock for the endpoint listing the rooms the user
+    /// has joined.
+    pub fn mock_joined_rooms(&self) -> MockEndpoint<'_, JoinedRoomsEndpoint> {
+        let mock = Mock::given(method("GET")).and(path_regex(r"^/_matrix/client/v3/joined_rooms$"));
+        self.mock_endpoint(mock, JoinedRoomsEndpoint).expect_default_access_token()
+    }
+
     /// Creates a prebuilt mock for the endpoint used to set a room's pinned
     /// events.
     pub fn mock_set_room_pinned_events(&self) -> MockEndpoint<'_, SetRoomPinnedEventsEndpoint> {
@@ -3997,6 +4004,18 @@ impl<'a> MockEndpoint<'a, RoomSummaryEndpoint> {
             room_id,
             vec![("membership".to_owned(), membership.as_str().into())],
         )
+    }
+}
+
+/// A prebuilt mock for `GET /_matrix/client/v3/joined_rooms` requests.
+pub struct JoinedRoomsEndpoint;
+
+impl<'a> MockEndpoint<'a, JoinedRoomsEndpoint> {
+    /// Returns a successful response with the given joined room IDs.
+    pub fn ok(self, joined_rooms: Vec<OwnedRoomId>) -> MatrixMock<'a> {
+        self.ok_json(json!({
+            "joined_rooms": joined_rooms,
+        }))
     }
 }
 

@@ -18,11 +18,17 @@
 //! This offers a few capabilities for previewing the content of the room as
 //! well.
 
+use std::collections::HashSet;
+
 use futures_util::future::join_all;
 use matrix_sdk_base::{RawStateEventWithKeys, RoomHeroWithProfile, RoomInfo, RoomState};
 use ruma::{
-    OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName,
-    api::client::{membership::joined_members, state::get_state_events},
+    OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId,
+    RoomVersionId, ServerName,
+    api::client::{
+        membership::{joined_members, joined_rooms},
+        state::get_state_events,
+    },
     events::room::history_visibility::HistoryVisibility,
     room::{JoinRuleSummary, RoomType},
 };
@@ -64,6 +70,9 @@ pub struct RoomPreview {
     /// What's the join rule for this room?
     pub join_rule: Option<JoinRuleSummary>,
 
+    /// The version of the room, if known.
+    pub room_version: Option<RoomVersionId>,
+
     /// Is the room world-readable (i.e. is its history_visibility set to
     /// world_readable)?
     pub is_world_readable: Option<bool>,
@@ -78,6 +87,25 @@ pub struct RoomPreview {
 
     /// Room heroes.
     pub heroes: Option<Vec<RoomHeroWithProfile>>,
+}
+
+/// Whether the current user satisfies the `allow` conditions of a room's join
+/// rule.
+///
+/// See [`RoomPreview::satisfies_join_rule_allow_conditions()`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum JoinRuleAllowConditions {
+    /// The current user satisfies at least one of the conditions, and can join
+    /// the room without an invite.
+    Satisfied,
+
+    /// The current user doesn't satisfy any of the conditions, or the join
+    /// rule doesn't allow joining based on conditions.
+    NotSatisfied,
+
+    /// It isn't known whether the current user satisfies the conditions.
+    Unknown,
 }
 
 impl RoomPreview {
@@ -101,6 +129,7 @@ impl RoomPreview {
             avatar_url: room_info.avatar_url().map(ToOwned::to_owned),
             room_type: room_info.room_type().cloned(),
             join_rule: room_info.join_rule().cloned().map(Into::into),
+            room_version: room_info.room_version().cloned(),
             is_world_readable: room_info
                 .history_visibility()
                 .map(|vis| *vis == HistoryVisibility::WorldReadable),
@@ -177,6 +206,104 @@ impl RoomPreview {
         }
     }
 
+    /// Whether the current user satisfies at least one of the `allow`
+    /// conditions of this room's `restricted` or `knock_restricted` join
+    /// rule, i.e. whether they can join the room without an invite and
+    /// without knocking.
+    ///
+    /// Only `m.room_membership` conditions are supported: they're satisfied if
+    /// the current user is joined to the given room. This is checked against
+    /// the local store first and, if none of the allowed rooms is joined there,
+    /// against the homeserver's list of joined rooms for the allowed rooms the
+    /// local store doesn't know about, since it may not have synced all the
+    /// rooms yet.
+    ///
+    /// Returns:
+    ///
+    /// - [`JoinRuleAllowConditions::NotSatisfied`] if the current user is
+    ///   banned from the room, if the join rule isn't `restricted` or
+    ///   `knock_restricted`, or if the room version doesn't support that join
+    ///   rule.
+    /// - [`JoinRuleAllowConditions::Unknown`] if the join rule, the room
+    ///   version rules or the allowed rooms aren't known. Notably, an empty
+    ///   list of allowed rooms is considered unknown, since previews from the
+    ///   room directory and some homeservers don't include it, and it doesn't
+    ///   include conditions other than `m.room_membership`. This is also
+    ///   returned if the request to the homeserver fails.
+    pub async fn satisfies_join_rule_allow_conditions(
+        &self,
+        client: &Client,
+    ) -> crate::Result<JoinRuleAllowConditions> {
+        if self.state == Some(RoomState::Banned) {
+            return Ok(JoinRuleAllowConditions::NotSatisfied);
+        }
+
+        let Some(join_rule) = &self.join_rule else {
+            return Ok(JoinRuleAllowConditions::Unknown);
+        };
+
+        let (is_knock, summary) = match join_rule {
+            JoinRuleSummary::Restricted(summary) => (false, summary),
+            JoinRuleSummary::KnockRestricted(summary) => (true, summary),
+            _ => return Ok(JoinRuleAllowConditions::NotSatisfied),
+        };
+
+        if let Some(room_version) = &self.room_version {
+            let Some(rules) = room_version.rules() else {
+                return Ok(JoinRuleAllowConditions::Unknown);
+            };
+
+            let is_supported = if is_knock {
+                rules.authorization.knock_restricted_join_rule
+            } else {
+                rules.authorization.restricted_join_rule
+            };
+
+            if !is_supported {
+                return Ok(JoinRuleAllowConditions::NotSatisfied);
+            }
+        }
+
+        if summary.allowed_room_ids.is_empty() {
+            return Ok(JoinRuleAllowConditions::Unknown);
+        }
+
+        let base_client = client.base_client();
+        if summary.allowed_room_ids.iter().any(|room_id| {
+            base_client.get_room(room_id).is_some_and(|room| room.state() == RoomState::Joined)
+        }) {
+            return Ok(JoinRuleAllowConditions::Satisfied);
+        }
+
+        // Rooms known locally but not joined can't satisfy the conditions, so
+        // only ask the homeserver about the unknown ones.
+        let unknown_room_ids: Vec<_> = summary
+            .allowed_room_ids
+            .iter()
+            .filter(|room_id| base_client.get_room(room_id).is_none())
+            .collect();
+
+        if unknown_room_ids.is_empty() {
+            return Ok(JoinRuleAllowConditions::NotSatisfied);
+        }
+
+        let response = match client.send(joined_rooms::v3::Request::new()).await {
+            Ok(response) => response,
+            Err(err) => {
+                warn!("error when fetching the joined rooms: {err}");
+                return Ok(JoinRuleAllowConditions::Unknown);
+            }
+        };
+
+        let joined_room_ids: HashSet<_> = response.joined_rooms.iter().collect();
+
+        Ok(if unknown_room_ids.iter().any(|room_id| joined_room_ids.contains(room_id)) {
+            JoinRuleAllowConditions::Satisfied
+        } else {
+            JoinRuleAllowConditions::NotSatisfied
+        })
+    }
+
     /// Get a [`RoomPreview`] by searching in the room directory for the
     /// provided room alias or room id and transforming the [`RoomDescription`]
     /// into a preview.
@@ -251,13 +378,12 @@ impl RoomPreview {
 
         // The server returns a `Left` room state for rooms the user has not
         // joined. Be more precise than that, and set it to `None` if we haven't
-        // joined that room.
+        // joined that room. Keep a ban though, since it means the user can't
+        // join the room.
         let cached_room = client.get_room(&room_id);
-        let state = if cached_room.is_none() {
-            None
-        } else {
-            response.membership.map(|membership| RoomState::from(&membership))
-        };
+        let state = response.membership.map(|membership| RoomState::from(&membership));
+        let state =
+            if cached_room.is_none() && state != Some(RoomState::Banned) { None } else { state };
 
         let num_active_members = cached_room.as_ref().map(|r| r.active_members_count());
 
@@ -285,6 +411,7 @@ impl RoomPreview {
             num_active_members,
             room_type: summary.room_type,
             join_rule: Some(summary.join_rule),
+            room_version: summary.room_version,
             is_world_readable: Some(summary.world_readable),
             state,
             is_direct,
@@ -369,6 +496,7 @@ async fn search_for_room_preview_in_room_directory(
             // Assume it's a room
             room_type: None,
             join_rule: Some(room_description.join_rule.into()),
+            room_version: None,
             is_world_readable: Some(room_description.is_world_readable),
             state: None,
             is_direct: None,

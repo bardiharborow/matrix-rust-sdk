@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use anyhow::Context as _;
-use matrix_sdk::{Client, room_preview::RoomPreview as SdkRoomPreview};
+use matrix_sdk::{
+    Client,
+    room_preview::{JoinRuleAllowConditions, RoomPreview as SdkRoomPreview},
+};
 use ruma::room::{JoinRuleSummary, RoomType as RumaRoomType};
 
 use crate::{
@@ -55,6 +58,28 @@ impl RoomPreview {
                 .as_ref()
                 .map(|heroes| heroes.iter().map(|h| h.to_owned().into()).collect()),
         }
+    }
+
+    /// Whether the current user satisfies at least one of the `allow`
+    /// conditions of this room's `restricted` or `knock_restricted` join rule,
+    /// i.e. whether they can join the room without an invite and without
+    /// knocking.
+    ///
+    /// Only `m.room_membership` conditions are supported: they're satisfied if
+    /// the current user is joined to the given room. If that isn't the case
+    /// according to the local store, the homeserver is asked for the list of
+    /// joined rooms.
+    ///
+    /// Returns [`JoinRuleAllowConditions::NotSatisfied`] if the current user is
+    /// banned from the room, if the join rule isn't `restricted` or
+    /// `knock_restricted`, or if the room version doesn't support it, and
+    /// [`JoinRuleAllowConditions::Unknown`] if the join rule, the room version
+    /// rules or the allowed rooms aren't known (notably, if the list of
+    /// allowed rooms is empty), or if the request to the homeserver fails.
+    pub async fn satisfies_join_rule_allow_conditions(
+        &self,
+    ) -> Result<JoinRuleAllowConditions, ClientError> {
+        Ok(self.inner.satisfies_join_rule_allow_conditions(&self.client).await?)
     }
 
     /// Leave the room if the room preview state is either joined, invited or
